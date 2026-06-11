@@ -1,93 +1,85 @@
 """
-Lab 11 — Part 2A: Input Guardrails
+Lab 11 - Part 2A: Input Guardrails
   TODO 3: Injection detection (regex)
   TODO 4: Topic filter
   TODO 5: Input Guardrail Plugin (ADK)
 """
 import re
+import sys
+import unicodedata
+from pathlib import Path
 
-from google.genai import types
-from google.adk.plugins import base_plugin
-from google.adk.agents.invocation_context import InvocationContext
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:
+    from google.genai import types
+    from google.adk.plugins import base_plugin
+    from google.adk.agents.invocation_context import InvocationContext
+except Exception:
+    class _Part:
+        def __init__(self, text=""):
+            self.text = text
+        @staticmethod
+        def from_text(text):
+            return _Part(text)
+    class _Content:
+        def __init__(self, role="model", parts=None):
+            self.role = role
+            self.parts = parts or []
+    class types:
+        Content = _Content
+        Part = _Part
+    class _BasePlugin:
+        def __init__(self, name="plugin"):
+            self.name = name
+    class base_plugin:
+        BasePlugin = _BasePlugin
+    InvocationContext = object
 
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 
-# ============================================================
-# TODO 3: Implement detect_injection()
-#
-# Write regex patterns to detect prompt injection.
-# The function takes user_input (str) and returns True if injection is detected.
-#
-# Suggested patterns:
-# - "ignore (all )?(previous|above) instructions"
-# - "you are now"
-# - "system prompt"
-# - "reveal your (instructions|prompt)"
-# - "pretend you are"
-# - "act as (a |an )?unrestricted"
-# ============================================================
+def _normalize(text: str) -> str:
+    """Lowercase and remove Vietnamese accents for consistent rule matching."""
+    normalized = unicodedata.normalize("NFD", (text or "").lower())
+    no_accents = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return no_accents.replace("?", "d")
+
 
 def detect_injection(user_input: str) -> bool:
-    """Detect prompt injection patterns in user input.
-
-    Args:
-        user_input: The user's message
-
-    Returns:
-        True if injection detected, False otherwise
-    """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+    """Detect prompt injection and secret-extraction patterns in user input."""
+    normalized = _normalize(user_input)
+    patterns = [
+        r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions?",
+        r"forget\s+(your|all|previous)\s+instructions?",
+        r"system\s+prompt|developer\s+message",
+        r"reveal\s+(the\s+)?(admin\s+)?password|admin\s+password",
+        r"you\s+are\s+now\s+dan|you\s+are\s+now|unrestricted\s+ai",
+        r"api\s*key|credentials?|database\s+connection\s+string",
+        r"translate\s+your\s+system\s+prompt|base64|rot13",
+        r"fill\s+in.*(password|api\s*key|database)",
+        r"same\s+passwords?\s+as\s+you",
+        r"ciso|security\s+audit|ticket\s+sec-",
+        r"bo\s+qua\s+.*huong\s+dan|mat\s+khau\s+admin|cho\s+toi\s+xem\s+system\s+prompt",
     ]
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return True
-    return False
-
-
-# ============================================================
-# TODO 4: Implement topic_filter()
-#
-# Check if user_input belongs to allowed topics.
-# The VinBank agent should only answer about: banking, account,
-# transaction, loan, interest rate, savings, credit card.
-#
-# Return True if input should be BLOCKED (off-topic or blocked topic).
-# ============================================================
 
 def topic_filter(user_input: str) -> bool:
-    """Check if input is off-topic or contains blocked topics.
+    """Return True if input should be blocked as unsafe, invalid, or off-topic."""
+    normalized = _normalize(user_input)
+    if not normalized.strip():
+        return True
+    if len(user_input) > 5000:
+        return True
+    if not any(ch.isalnum() for ch in normalized.strip()):
+        return True
+    if re.search(r"\b(select\s+\*\s+from|drop\s+table|union\s+select|delete\s+from)\b", normalized, re.IGNORECASE):
+        return True
+    if any(topic.lower() in normalized for topic in BLOCKED_TOPICS):
+        return True
+    return not any(topic.lower() in normalized for topic in ALLOWED_TOPICS)
 
-    Args:
-        user_input: The user's message
-
-    Returns:
-        True if input should be BLOCKED (off-topic or blocked topic)
-    """
-    input_lower = user_input.lower()
-
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
-
-    pass  # Replace with your implementation
-
-
-# ============================================================
-# TODO 5: Implement InputGuardrailPlugin
-#
-# This plugin blocks bad input BEFORE it reaches the LLM.
-# Fill in the on_user_message_callback method.
-#
-# NOTE: The callback uses keyword-only arguments (after *).
-#   - user_message is types.Content (not str)
-#   - Return types.Content to block, or None to pass through
-# ============================================================
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
@@ -108,39 +100,20 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
 
     def _block_response(self, message: str) -> types.Content:
         """Create a Content object with a block message."""
-        return types.Content(
-            role="model",
-            parts=[types.Part.from_text(text=message)],
-        )
+        return types.Content(role="model", parts=[types.Part.from_text(text=message)])
 
-    async def on_user_message_callback(
-        self,
-        *,
-        invocation_context: InvocationContext,
-        user_message: types.Content,
-    ) -> types.Content | None:
-        """Check user message before sending to the agent.
-
-        Returns:
-            None if message is safe (let it through),
-            types.Content if message is blocked (return replacement)
-        """
+    async def on_user_message_callback(self, *, invocation_context: InvocationContext, user_message: types.Content) -> types.Content | None:
+        """Check user message before sending to the agent."""
         self.total_count += 1
         text = self._extract_text(user_message)
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response("Xin loi, toi khong the cung cap thong tin do. Toi chi ho tro cac cau hoi ngan hang an toan.")
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response("I can only help with banking topics such as accounts, transfers, cards, loans, and interest rates.")
+        return None
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
-
-        pass  # Replace with your implementation
-
-
-# ============================================================
-# Quick tests
-# ============================================================
 
 def test_injection_detection():
     """Test detect_injection with sample inputs."""
@@ -182,12 +155,8 @@ async def test_input_plugin():
     ]
     print("Testing InputGuardrailPlugin:")
     for msg in test_messages:
-        user_content = types.Content(
-            role="user", parts=[types.Part.from_text(text=msg)]
-        )
-        result = await plugin.on_user_message_callback(
-            invocation_context=None, user_message=user_content
-        )
+        user_content = types.Content(role="user", parts=[types.Part.from_text(text=msg)])
+        result = await plugin.on_user_message_callback(invocation_context=None, user_message=user_content)
         status = "BLOCKED" if result else "PASSED"
         print(f"  [{status}] '{msg[:60]}'")
         if result and result.parts:
@@ -196,11 +165,7 @@ async def test_input_plugin():
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+    import asyncio
     test_injection_detection()
     test_topic_filter()
-    import asyncio
     asyncio.run(test_input_plugin())
